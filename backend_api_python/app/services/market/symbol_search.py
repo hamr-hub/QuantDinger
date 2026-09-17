@@ -9,6 +9,7 @@ from app.data.market_symbols_seed import (
     get_hot_symbols as seed_get_hot_symbols,
     search_symbols as seed_search_symbols,
 )
+from app.data_sources import cn_hk_offline
 from app.services.symbol_name import persist_seed_name
 from app.services.market.instrument_products import classify_instrument_product
 from app.services.market_context import (
@@ -77,7 +78,95 @@ def search_market_symbols(
     exchange_id: str = "",
     market_type: str = "",
 ) -> list:
-    """Search the local catalog, using external fallbacks only for equities."""
+    """Search the local catalog, using external fallbacks only for equities.
+
+    For ``CNStock`` we additionally probe the offline ``data/stock_basic`` CSV
+    before any network call — name/code/pinyin matches against ~5,860 A-share
+    rows are instant and never rate-limited.
+
+    Mixed-search support: when ``market`` is one of ``"ALL"`` / ``"MIXED"`` /
+    ``"*"`` or a comma-separated list (e.g. ``"USStock,CNStock,HKStock"``),
+    search each market in turn and interleave the results so the first ``limit``
+    rows span multiple exchanges instead of being dominated by the first market.
+    """
+    raw_market = (market or "").strip()
+    keyword = (keyword or "").strip().upper()
+    limit = max(1, int(limit or 20))
+    if not raw_market or not keyword:
+        return []
+
+    target_markets = _resolve_market_targets(raw_market)
+    if not target_markets:
+        return []
+
+    if len(target_markets) == 1:
+        return _search_single_market(
+            target_markets[0], keyword, limit,
+            exchange_id=exchange_id, market_type=market_type,
+        )
+
+    # Mixed-search path: round-robin each market so the user sees US + CN + HK
+    # results side by side instead of US-only-then-CN-then-HK.
+    per_market_quota = max(limit, 1)
+    per_market_cap = max(limit // max(len(target_markets), 1) + 2, 5)
+    combined: list = []
+    seen: set = set()
+    # Snapshot the quota so we can iterate once with a reasonable split,
+    # then fill any remaining slots by re-querying whichever market still
+    # has headroom.
+    for m in target_markets:
+        if len(combined) >= per_market_quota:
+            break
+        rows = _search_single_market(
+            m, keyword, per_market_cap,
+            exchange_id=exchange_id, market_type=market_type,
+        )
+        for row in rows:
+            key = (row.get("market"), row.get("symbol"))
+            if key in seen:
+                continue
+            seen.add(key)
+            combined.append(row)
+            if len(combined) >= per_market_quota:
+                break
+    return dedupe_symbol_results(combined, per_market_quota)
+
+
+def _resolve_market_targets(raw: str) -> list:
+    """Turn ``"ALL"`` / ``"*"`` / ``"USStock,CNStock"`` into a concrete list.
+
+    Order is preserved as supplied so callers can bias the result toward a
+    specific market (e.g. ``"USStock,ALL"`` puts US hits first).
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return []
+    if raw.upper() in {"ALL", "*", "MIXED", "ANY"}:
+        return ["USStock", "CNStock", "HKStock"]
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    if not parts:
+        return []
+    # Expand any "ALL" inside a list too.
+    out: list = []
+    for p in parts:
+        if p.upper() in {"ALL", "*", "MIXED", "ANY"}:
+            for m in ("USStock", "CNStock", "HKStock"):
+                if m not in out:
+                    out.append(m)
+        elif p not in out:
+            out.append(p)
+    return out
+
+
+def _search_single_market(
+    market: str,
+    keyword: str,
+    limit: int,
+    *,
+    exchange_id: str = "",
+    market_type: str = "",
+) -> list:
+    """Inner helper for ``search_market_symbols`` (single-market path)."""
     market = (market or "").strip()
     keyword = (keyword or "").strip().upper()
     limit = max(1, int(limit or 20))
@@ -96,8 +185,21 @@ def search_market_symbols(
         seed_search_symbols(market=market, keyword=keyword, limit=limit),
         limit,
     )
-    if out:
-        return out
+
+    # Offline-first probe for CNStock: stock_basic has every A-share's
+    # code/Chinese name/pinyin abbreviation, so we hit it before paying the
+    # AkShare/Yahoo network cost. It also covers the case where the DB seed
+    # hasn't been populated yet (cold start).
+    if market == "CNStock" and len(out) < limit and cn_hk_offline.is_available():
+        offline_hits = cn_hk_offline.search_a_share_symbols(
+            keyword=keyword, limit=limit - len(out),
+        )
+        for hit in offline_hits:
+            persist_seed_name("CNStock", hit["symbol"], hit.get("name", ""))
+        out.extend(dedupe_symbol_results(offline_hits, limit - len(out)))
+
+    if len(out) >= limit:
+        return dedupe_symbol_results(out, limit)
 
     existing = {r["symbol"] for r in out}
     if market in {"USStock", "CNStock", "HKStock"}:
@@ -173,7 +275,51 @@ def find_available_crypto_symbol(
 
 
 def get_hot_symbols(market: str, limit: int = 10) -> list:
-    """Return curated hot symbols backed by a concrete market-data identity."""
+    """Return curated hot symbols for a market.
+
+    Crypto picks are filtered to pairs backed by a concrete supported
+    market-data identity.
+
+    Mixed-market support: ``ALL`` / ``*`` / ``"USStock,CNStock,HKStock"``
+    returns an interleaved hot list (default 4 per market, then any remaining
+    slots distributed evenly). The result is interleaved (round-robin) so the
+    first row isn't always US, the second always CN, etc.
+    """
+    targets = _resolve_market_targets(market or "")
+    if not targets:
+        return []
+    limit = max(1, int(limit or 10))
+    if len(targets) == 1:
+        return _get_single_market_hot(targets[0], limit)
+
+    per_market = max(int((limit // len(targets)) + 1), 4)
+    buckets: list = []
+    for m in targets:
+        rows = _get_single_market_hot(m, per_market) or []
+        buckets.append(rows)
+    out: list = []
+    seen: set = set()
+    while True:
+        progress = False
+        for bucket in buckets:
+            if bucket:
+                row = bucket.pop(0)
+                key = (row.get("market"), row.get("symbol"))
+                if key in seen:
+                    progress = True
+                    continue
+                seen.add(key)
+                out.append(row)
+                progress = True
+                if len(out) >= limit:
+                    return out
+        if not progress:
+            break
+    return dedupe_symbol_results(out, limit)
+
+
+def _get_single_market_hot(market: str, limit: int) -> list:
+    """Curated hot list for one market, with Crypto availability filtering."""
     market = (market or "").strip()
     limit = max(1, int(limit or 10))
     curated = seed_get_hot_symbols(market=market, limit=limit)
@@ -522,4 +668,3 @@ def _search_external_symbols(market: str, keyword: str, limit: int, existing: se
     if rows:
         _market_cache.set(cache_key, rows, SYMBOL_SEARCH_CACHE_TTL_SEC)
     return [r for r in rows if r.get("symbol") not in existing][:limit]
-

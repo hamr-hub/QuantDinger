@@ -207,6 +207,12 @@ services:
     volumes:
       - backend_logs:/app/logs
       - backend_data:/app/data
+      # Bind-mount the host's <repo>/data/ into the container so the offline
+      # T+1 dataset (data/stock_basic + data/stk_factor + data/fina_indicator)
+      # is reachable at /app/data_offline inside the container. The repo-level
+      # CN/HK adapter (``app.data_sources.cn_hk_offline``) reads it via the
+      # QD_OFFLINE_DATA_DIR env var below.
+      - ../data:/app/data_offline:ro
       # Mount .env for runtime config and admin-panel updates
       - ./backend_api_python/.env:/app/.env
     environment:
@@ -234,6 +240,13 @@ services:
       - CELERY_BROKER_URL=${CELERY_BROKER_URL:-}
       - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND:-}
       - SKIP_AUTO_MIGRATE=true
+      # Offline A股 T+1 dataset (CN/HK adaptation, 2026-07-02).
+      # Set QD_OFFLINE_DATA_DIR explicitly so the in-container path resolves
+      # the same dataset regardless of how the backend is launched.
+      - QD_OFFLINE_DATA_DIR=/app/data_offline
+      # Show A-share + HK watchlist pickers by default (was CN=false before).
+      - SHOW_CN_STOCK=${SHOW_CN_STOCK:-true}
+      - SHOW_HK_STOCK=${SHOW_HK_STOCK:-true}
       # Database connection pool tuning (see app/utils/db_postgres.py).
       # Defaults are safe for ~50 concurrent DB users; raise if you run many
       # bots or see `connection pool exhausted` errors.

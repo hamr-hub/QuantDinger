@@ -158,7 +158,14 @@ def get_menu_footer_config():
 def search_symbols():
     """
     Lightweight symbol search.
-    Crypto search is local-only; exchange catalogs are refreshed by the background sync task.
+    Local catalog first; Crypto search is local-only (catalogs are refreshed
+    by the background sync task), while equities fall back to external
+    market sources when the DB yields few results.
+
+    Mixed-market support (added 2026-07-02 for the US/CN/HK switcher):
+      market=ALL           → round-robin search USStock, CNStock, HKStock
+      market=USStock,HK    → search only those (any combination, in order)
+      market=USStock       → legacy single-market search
     """
     try:
         market = (request.args.get('market') or '').strip()
@@ -185,7 +192,12 @@ def search_symbols():
 
 @market_blp.route('/symbols/hot', methods=['GET'])
 def get_hot_symbols():
-    """Return a small curated hot list per market (local-only)."""
+    """Return a small curated hot list per market (local-only).
+
+    Mixed-market support: ``market=ALL`` returns an interleaved hot list
+    spanning USStock + CNStock + HKStock so the UI can show one "All markets"
+    hot row without per-market clicks.
+    """
     try:
         market = (request.args.get('market') or '').strip()
         limit = int(request.args.get('limit') or 10)
@@ -358,6 +370,5 @@ def get_price():
 
 # openapi-compat: legacy import name
 market_bp = market_blp
-
 
 

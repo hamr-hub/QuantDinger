@@ -1,12 +1,16 @@
 """
 中国A股数据源 — 多层 fallback
 
-有 TWELVE_DATA_API_KEY:
-  所有周期 → Twelve Data（主） → 腾讯日/周线 → yfinance → AkShare
+数据源优先级（首个非空即返回）:
 
-无 API Key:
-  分钟/小时 → yfinance → AkShare
-  日/周线 → 腾讯 fqkline → yfinance → AkShare
+  Tier 0  本地 T+1 离线数据 (data/{stk_factor,weekly,monthly}/*.csv)
+           —— 瞬时、不依赖网络、覆盖全部 A 股
+  Tier 1  Twelve Data（付费，海外最稳）
+  Tier 2  腾讯 fqkline（日/周线，免费，国内最稳）
+  Tier 3  yfinance
+  Tier 4  AkShare（境外偶有失败，最后兜底）
+
+实时报价: 腾讯 qt.gtimg.cn（最快、免费）
 """
 
 from __future__ import annotations
@@ -22,6 +26,7 @@ from app.data_sources.asia_stock_kline import (
     fetch_akshare_minute_klines,
     fetch_akshare_weekly_klines,
 )
+from app.data_sources import cn_hk_offline
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -61,6 +66,27 @@ class CNStockDataSource(BaseDataSource):
         code = normalize_cn_code(symbol)
         tf = normalize_chart_timeframe(timeframe)
         lim = max(int(limit or 300), 1)
+
+        # Tier 0: Local T+1 offline data (data/ directory).
+        # Covers 1D/1W/1M only; for intraday 1m/5m/... we always fall through
+        # to live sources. Free, instant, and works behind the GFW.
+        if tf in ("1D", "1W", "1M") and cn_hk_offline.is_available():
+            offline_rows = cn_hk_offline.read_offline_kline(
+                symbol=code, timeframe=tf, limit=lim,
+                before_time=before_time, after_time=after_time,
+            )
+            if offline_rows:
+                logger.debug(
+                    "CN offline kline hit: %s tf=%s -> %d rows",
+                    code, tf, len(offline_rows),
+                )
+                return self.filter_and_limit(
+                    offline_rows,
+                    limit=lim,
+                    before_time=before_time,
+                    after_time=after_time,
+                    truncate=(after_time is None),
+                )
 
         # Tier 1: Twelve Data (paid, most reliable)
         rows = fetch_twelvedata_klines(

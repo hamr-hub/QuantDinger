@@ -12,9 +12,11 @@ Resolution order (first match wins):
 1. ``ENABLED_MARKETS`` (CSV whitelist). When non-empty, ONLY the listed
    markets are visible. Unknown values are ignored. This is the primary knob
    for "I want X and Y, nothing else".
-2. ``SHOW_CN_STOCK`` (legacy boolean, default ``false``). Drops ``CNStock``
+2. ``SHOW_CN_STOCK`` (legacy boolean, default ``true``). Drops ``CNStock``
    when off. Kept for back-compat with deployments that predate
-   ``ENABLED_MARKETS``.
+   ``ENABLED_MARKETS``. Default flipped from false → true on 2026-07-02 once
+   the offline ``data/stock_basic`` + Tencent free quote path made the A-share
+   catalog stable enough to expose without any external paid key.
 3. ``SHOW_HK_STOCK`` (legacy boolean, default ``true``). Drops ``HKStock``
    when off. Same back-compat reasoning.
 4. Everything else defaults to visible.
@@ -66,7 +68,7 @@ def is_market_visible(market: str) -> bool:
         return m in whitelist
 
     if m == 'CNStock':
-        return _flag('SHOW_CN_STOCK', 'false')
+        return _flag('SHOW_CN_STOCK', 'true')
     if m == 'HKStock':
         return _flag('SHOW_HK_STOCK', 'true')
     return True

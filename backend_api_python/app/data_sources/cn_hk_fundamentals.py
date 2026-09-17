@@ -27,6 +27,7 @@ from app.data_sources.asia_stock_kline import (
     ak_a_code_from_tencent,
     ak_hk_code_from_tencent,
 )
+from app.data_sources import cn_hk_offline
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -405,11 +406,47 @@ def _individual_info_map(symbol_6: str) -> Dict[str, Any]:
 
 
 def fetch_cn_fundamental_akshare(tencent_code: str) -> Dict[str, Any]:
-    """PE/PB/PS, market cap, ROE proxy, EPS for A-share (best-effort)."""
+    """PE/PB/PS, market cap, ROE proxy, EPS for A-share (best-effort).
+
+    Tier 0: local ``data/fina_indicator`` (offline, instant) — returns
+    company profile + financial ratios from the latest report.
+    Tier 1: AkShare Eastmoney (PE/PB/PS/PEG/market cap; fragile overseas).
+    """
     sym6 = ak_a_code_from_tencent(tencent_code)
     if not sym6:
         return {}
-    result: Dict[str, Any] = {"source": "akshare_em"}
+
+    # Tier 0: offline T+1 data
+    if cn_hk_offline.is_available():
+        offline_fin = cn_hk_offline.read_offline_financial_indicators(f"{sym6}.SH")
+        offline_profile = cn_hk_offline.get_company_profile(f"{sym6}.SH")
+        if offline_fin or offline_profile:
+            result: Dict[str, Any] = {"source": "offline_fina_indicator"}
+            # Carry over the offline financial ratios.
+            for k, v in offline_fin.items():
+                if k in ("source", "history"):
+                    continue
+                if v is not None:
+                    result.setdefault(k, v)
+            if offline_profile:
+                for k in ("full_name", "english_name", "industry", "region",
+                          "market_type", "exchange", "currency", "hk_connect",
+                          "pinyin", "controller", "enterprise_nature",
+                          "listing_date"):
+                    v = offline_profile.get(k)
+                    if v:
+                        result.setdefault(k, v)
+                if offline_profile.get("name") and not result.get("name"):
+                    result["name"] = offline_profile["name"]
+            if offline_fin.get("history"):
+                result["financial_history"] = offline_fin["history"]
+            logger.debug(
+                "CN offline fundamentals hit %s -> %d fields",
+                sym6, sum(1 for v in result.values() if v is not None),
+            )
+            return result
+
+    result = {"source": "akshare_em"}
     info = _individual_info_map(sym6)
     if info:
         result["market_cap"] = _float_clean(info.get("总市值"))
@@ -426,7 +463,7 @@ def fetch_cn_fundamental_akshare(tencent_code: str) -> Dict[str, Any]:
         with _bypass_proxy():
             vdf = ak.stock_zh_valuation_comparison_em(symbol=em_sym)
     except Exception as e:
-        logger.debug("stock_zh_valuation_comparison_em failed %s: %s", em_sym, e)
+        logger.debug("stock_zh_valuation_em failed %s: %s", em_sym, e)
         vdf = None
 
     if vdf is not None and not vdf.empty and "代码" in vdf.columns:
@@ -478,11 +515,48 @@ def fetch_hk_fundamental_akshare(tencent_code: str) -> Dict[str, Any]:
 
 
 def fetch_cn_company_extras(tencent_code: str) -> Dict[str, Any]:
+    """Return supplemental company metadata (industry, listing date, etc.).
+
+    Tier 0: local ``data/stock_basic`` — covers all A-shares instantly and
+    includes industry, listing date, controller, full name (中/英), pinyin,
+    exchange, currency, HK-connect flag.
+    """
     sym6 = ak_a_code_from_tencent(tencent_code)
     if not sym6:
         return {}
+
+    # Tier 0: offline company profile from data/stock_basic
+    if cn_hk_offline.is_available():
+        # Need the market suffix to look up in stock_basic; default to SH then SZ then BJ.
+        offline = None
+        for suffix in ("SH", "SZ", "BJ"):
+            cand = f"{sym6}.{suffix}"
+            if cn_hk_offline.is_a_share_symbol(cand):
+                profile = cn_hk_offline.get_company_profile(cand)
+                if profile.get("name"):
+                    offline = profile
+                    break
+        if offline:
+            out: Dict[str, Any] = {"source": "offline_stock_basic"}
+            # Map offline keys to the same names used by AkShare/Twelve Data
+            # callers downstream.
+            if offline.get("industry"):
+                out["industry"] = offline["industry"]
+            if offline.get("listing_date"):
+                # AkShare uses 上市时间 / 上市日期; we expose both.
+                out["ipo_date"] = offline["listing_date"]
+                out["listing_date"] = offline["listing_date"]
+            for k in ("name", "full_name", "english_name", "region",
+                      "market_type", "exchange", "currency", "hk_connect",
+                      "pinyin", "controller", "enterprise_nature"):
+                v = offline.get(k)
+                if v:
+                    out.setdefault(k, v)
+            logger.debug("CN offline company extras hit %s -> %d fields", sym6, len(out))
+            return out
+
     info = _individual_info_map(sym6)
-    out: Dict[str, Any] = {}
+    out = {}
     if info.get("行业"):
         out["industry"] = str(info["行业"]).strip()
     if info.get("上市时间"):
